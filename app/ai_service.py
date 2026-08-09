@@ -1,90 +1,134 @@
-import os
 import time
-from typing import List, Dict, Any
 from ultralytics import YOLO
+from fastapi import HTTPException
 
 
-class InfrastructureModelService:
-    def __init__(self, weights_path: str = "best.pt"):
-        self.weights_path = weights_path
-        self.confidence_threshold = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
-        self.model = None
-        self.load_model()
+class AIEngine:
+    def __init__(self):
+        print("Loading AI Models into memory...")
+        # Load both models once when the app boots up
+        self.road_model = YOLO("app/weights/road_damage_model.pt")
+        self.struct_model = YOLO("app/weights/building_bridge_model.pt")
 
-    def load_model(self):
-        """Loads the YOLOv8 model weights, with a fallback stub if weights aren't ready yet."""
-        try:
-            if os.path.exists(self.weights_path):
-                print(f"Loading YOLOv8 weights from {self.weights_path}...")
-                self.model = YOLO(self.weights_path)
-            else:
-                print(f"Warning: {self.weights_path} not found. Operating in MOCK mode until training completes.")
-                self.model = None
-        except Exception as e:
-            print(f"Error loading model weights: {e}. Falling back to mock mode.")
-            self.model = None
-
-    def calculate_danger_level(self, detections: List[Dict[str, Any]]) -> str:
-        """
-        Evaluates risk based on detected damage classes and confidence scores.
-        """
+    def _calculate_road_danger(self, detections):
         if not detections:
-            return "Low"
+            return "Safe / No Road Damage"
 
-        # Count high-risk indicators or total count
-        total_detections = len(detections)
-        max_conf = max([d["confidence"] for d in detections])
+        score = 0
+        high_risk = ["d40", "d43", "d44"]
+        medium_risk = ["d20", "d10", "d11"]
 
-        # Example heuristic logic for infrastructure damage risk
-        critical_labels = {"exposed_rebar", "severe_spallation", "deep_pothole"}
-        has_critical_damage = any(d["label"] in critical_labels for d in detections)
+        for d in detections:
+            c_name = d["label"].lower()
+            if any(k in c_name for k in high_risk):
+                score += 10 * d["confidence"]
+            elif any(k in c_name for k in medium_risk):
+                score += 5 * d["confidence"]
+            else:
+                score += 2 * d["confidence"]
 
-        if has_critical_damage and max_conf > 0.75:
-            return "Critical"
-        elif total_detections >= 4 or max_conf > 0.85:
-            return "High"
-        elif total_detections >= 2:
-            return "Medium"
-        else:
-            return "Low"
+        if score > 18:
+            return "Critical Hazard - Urgent Road Repair Needed"
+        elif score > 10:
+            return "High Risk - Pavement Deteriorating"
+        elif score > 4:
+            return "Medium Risk - Monitor Surface"
+        return "Low Risk - Minor Surface Blemishes"
 
-    def predict(self, image_path: str) -> tuple[List[Dict[str, Any]], str, float]:
-        """
-        Runs inference on an image and returns detections, calculated danger level, and execution time.
-        """
+    def _calculate_structural_danger(self, detections):
+        if not detections:
+            return "Safe / No Structural Damage"
+
+        score = 0
+        critical_keywords = ["exposedbars", "spallation", "collapse"]
+        moderate_keywords = ["efflorescence", "corrosionstain", "crack"]
+
+        for d in detections:
+            c_name = d["label"].lower()
+            if any(k in c_name for k in critical_keywords):
+                score += 8 * d["confidence"]
+            elif any(k in c_name for k in moderate_keywords):
+                score += 3 * d["confidence"]
+            else:
+                score += 1
+
+        if score > 20:
+            return "Critical - Structural Integrity Compromised"
+        elif score > 10:
+            return "High Risk - Maintenance Required"
+        elif score > 4:
+            return "Medium Risk - Monitor Closely"
+        return "Low Risk - Minor Surface Wear"
+
+    def predict(self, image_path: str, image_category: str):
         start_time = time.time()
-        detections = []
 
-        if self.model is not None:
-            # Real YOLOv8 Inference
-            results = self.model(image_path, conf=self.confidence_threshold)
-            result = results[0]
-
-            for box in result.boxes:
-                class_id = int(box.cls[0])
-                confidence = float(box.conf[0])
-                label = result.names.get(class_id, f"class_{class_id}")
-                bbox = box.xyxy[0].tolist()  # [xmin, ymin, xmax, ymax]
-
-                detections.append({
-                    "class_id": class_id,
-                    "label": label,
-                    "confidence": round(confidence, 4),
-                    "bbox": [round(coord, 2) for coord in bbox]
-                })
+        # Route to the correct model based on the form input
+        cat_lower = image_category.lower()
+        if "road" in cat_lower or "pothole" in cat_lower:
+            primary_model = self.road_model
+            fallback_model = self.struct_model
+            is_road = True
         else:
-            # Fallback mock data if model is still training on Colab
-            time.sleep(0.1)  # Simulate inference lag
-            detections = [
-                {"class_id": 4, "label": "spallation", "confidence": 0.89, "bbox": [100.0, 150.0, 300.0, 400.0]},
-                {"class_id": 12, "label": "pothole", "confidence": 0.92, "bbox": [50.0, 80.0, 200.0, 220.0]}
-            ]
+            primary_model = self.struct_model
+            fallback_model = self.road_model
+            is_road = False
 
-        danger_level = self.calculate_danger_level(detections)
-        execution_time_ms = (time.time() - start_time) * 1000
+        # Run primary model
+        results = primary_model(image_path)
+        active_model = primary_model
 
-        return detections, danger_level, round(execution_time_ms, 2)
+        detections = []
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                cls_name = active_model.names[cls_id]
+
+                if cls_name.lower() != "background":
+                    detections.append({
+                        "class_id": cls_id,
+                        "label": cls_name,
+                        "confidence": round(float(box.conf[0]), 2),
+                        "bbox": [round(float(x), 2) for x in box.xyxy[0].tolist()]
+                    })
+
+        # EDGE CASE FIX 1: If user selected wrong category and 0 detections found, try fallback model
+        if not detections:
+            print("Primary model found nothing. Triggering cross-category fallback...")
+            active_model = fallback_model
+            is_road = not is_road
+            results = active_model(image_path)
+
+            for r in results:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    cls_name = active_model.names[cls_id]
+
+                    if cls_name.lower() != "background":
+                        detections.append({
+                            "class_id": cls_id,
+                            "label": cls_name,
+                            "confidence": round(float(box.conf[0]), 2),
+                            "bbox": [round(float(x), 2) for x in box.xyxy[0].tolist()]
+                        })
+
+        # EDGE CASE FIX 2: Relaxed threshold (0.20) to ensure legit photos with lower confidence pass through
+        if not detections or max([d["confidence"] for d in detections]) < 0.20:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input: Image does not appear to contain valid road or structural damage."
+            )
+
+        # Calculate danger level tailored to the category
+        if is_road:
+            danger_level = self._calculate_road_danger(detections)
+        else:
+            danger_level = self._calculate_structural_danger(detections)
+
+        execution_time_ms = round((time.time() - start_time) * 1000, 2)
+
+        return detections, danger_level, execution_time_ms
 
 
-# Global singleton service instance
-ai_engine = InfrastructureModelService()
+# Global instance imported by main.py
+ai_engine = AIEngine()

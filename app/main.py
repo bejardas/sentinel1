@@ -1,8 +1,10 @@
+import os
+import time
+from typing import List, Optional
 from fastapi import FastAPI, Depends, UploadFile, File, Form, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from typing import List, Optional
 
 from app.database import engine, Base, get_db
 from app.models import User, DetectionRecord
@@ -84,22 +86,16 @@ async def analyze_infrastructure(
     image_bytes = await image.read()
 
     # 2. Upload to Cloudinary CDN
-    public_id = f"{current_user.username}_{image.filename}_{int(time.time())}" if 'time' in globals() else f"{current_user.username}_{image.filename}"
-    # Quick fix for time module import inside function scope if needed
-    import time as t
-    public_id = f"{current_user.username}_{image.filename}_{int(t.time())}"
-
+    public_id = f"{current_user.username}_{image.filename}_{int(time.time())}"
     secure_image_url = upload_image_to_cloudinary(image_bytes, public_id)
 
-    # 3. Run AI Inference & Risk Evaluation
-    # Since model takes a local path or array, we can save temporarily or pass bytes depending on setup.
-    # To keep it robust with YOLO, let's write bytes to a temp local file for inference, then discard.
+    # 3. Run AI Inference & Risk Evaluation (Passing image_category to route models)
     temp_path = f"temp_{image.filename}"
     with open(temp_path, "wb") as temp_file:
         temp_file.write(image_bytes)
 
     try:
-        detections, danger_level, execution_time = ai_engine.predict(temp_path)
+        detections, danger_level, execution_time = ai_engine.predict(temp_path, image_category)
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -127,7 +123,21 @@ async def analyze_infrastructure(
     db.commit()
     db.refresh(db_record)
 
-    return db_record
+    # 7. Return payload formatted for DetectionRecordOut schema
+    return {
+        "id": db_record.id,
+        "filename": db_record.filename,
+        "image_category": db_record.image_category,
+        "raw_address": db_record.raw_address,
+        "map_link": db_record.map_link,
+        "danger_level": db_record.danger_level,
+        "total_detections": len(detections),
+        "detections": detections,
+        "execution_time_ms": execution_time,
+        "image_path": db_record.image_path,
+        "created_at": db_record.created_at,
+        "owner_id": db_record.owner_id
+    }
 
 
 @app.get("/api/v1/detections", response_model=List[DetectionRecordOut])
@@ -136,6 +146,27 @@ def get_user_detections(db: Session = Depends(get_db), current_user: User = Depe
     Standard users see only their uploads. Admins see all records across the system.
     """
     if current_user.role == "admin":
-        return db.query(DetectionRecord).all()
+        records = db.query(DetectionRecord).all()
+    else:
+        records = db.query(DetectionRecord).filter(DetectionRecord.owner_id == current_user.id).all()
 
-    return db.query(DetectionRecord).filter(DetectionRecord.owner_id == current_user.id).all()
+    # Format records to match DetectionRecordOut response schema
+    output_records = []
+    for r in records:
+        dets = r.detected_classes or []
+        output_records.append({
+            "id": r.id,
+            "filename": r.filename,
+            "image_category": r.image_category,
+            "raw_address": r.raw_address,
+            "map_link": r.map_link,
+            "danger_level": r.danger_level,
+            "total_detections": len(dets),
+            "detections": dets,
+            "execution_time_ms": getattr(r, "execution_time_ms", 0.0),
+            "image_path": r.image_path,
+            "created_at": r.created_at,
+            "owner_id": r.owner_id
+        })
+
+    return output_records

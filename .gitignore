@@ -1,0 +1,27 @@
+# Environments and Secrets
+.env
+.venv/
+venv/
+env/
+
+# PyCharm / IDE
+.idea/
+.vscode/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# AI Model Weights (Too large for Git)
+*.pt
+*.pth
+*.onnx
+
+# Docker
+.docker/
+
+# OS generated files
+.DS_Store
+Thumbs.db
